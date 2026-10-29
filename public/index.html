@@ -82,6 +82,36 @@
   .trace .tr { font-family: Consolas, monospace; }
   .trace .tr.ok { color: var(--green); }
   .trace .tr.bad { color: var(--orange); }
+  /* 能力过滤与思考强度编辑器 */
+  .pin-editor { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+  .pin-editor label { font-size: 11.5px; color: var(--dim); }
+  .pin-input { width: 100%; min-width: 220px; background: var(--card2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-family: Consolas, monospace; font-size: 12px; }
+  .pin-input:focus { outline: none; border-color: var(--accent); }  .pin-input.invalid { border-color: var(--red); }
+  .pin-hint { font-size: 11px; line-height: 1.55; }
+  .pin-hint.good { color: var(--green); }
+  .pin-hint.warn { color: var(--orange); }
+  .pin-hint.bad { color: var(--red); }
+  .pin-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .preset-btn { flex: none; background: transparent; border: 1px solid var(--accent); color: var(--accent); border-radius: 12px; padding: 3px 10px; font-size: 11.5px; cursor: pointer; }
+  .preset-btn:hover { background: var(--accent); color: #fff; }
+  .sum-chip.sum-has { background: #2a2a1f; color: #e3d18a; }
+  .reasoning-panel { margin-top: 8px; border-top: 1px dashed #232733; padding-top: 8px; }
+  .reasoning-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; margin-top: 6px; }
+  .reasoning-grid label { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--dim); }
+  .reasoning-grid select { max-width: none; width: 100%; padding: 3px 6px; font-size: 11.5px; }
+  /* 订阅模型表：模型 ID 列不换行，其余列给能力过滤面板留出宽度 */
+  #subBody td:first-child { white-space: nowrap; }
+  #subBody td { vertical-align: top; }
+  #subBody .ups-panel { min-width: 0; width: 100%; max-width: 320px; }
+  #subBody .ups-wrap { min-width: 0; }
+  #subBody .reasoning-grid { grid-template-columns: 1fr; }
+  #subBody .pin-input { min-width: 0; width: 100%; }
+  #subBody .row-actions { flex-direction: column; align-items: stretch; }
+  #subBody .row-actions button { white-space: nowrap; padding: 5px 10px; }
+  #subBody select { max-width: 130px; }
+  #subBody .uprow { flex-wrap: wrap; }
+  #subBody .uprow .pill { min-width: 48px; padding: 4px 10px; }
+  #subBody .uprow .ghost.mini.arrow-btn { min-width: 24px; padding: 3px 6px; }
 </style>
 </head>
 <body>
@@ -103,22 +133,24 @@
   </div>
 
   <div class="banner">
-    <b>实测结论（决定了本工具的工作方式）：</b><br>
-    ① <b>上游可枚举、可观测</b>：订阅模型响应元数据里带背后真正的模型 ID、可用上游列表与本次实际命中的上游；
-    「探测」按钮还会用一次零 token 消耗的假上游请求让网关报出精确的可用上游清单（直连→OpenRouter，规划器→Vercel AI Gateway）。<br>
-    ② <b>两类管道都能精确钉住上游</b>（已实测 <code class="mono">finalProvider</code> 随之改变）：
-    直连管道（OpenRouter）用顶层 <code class="mono">provider.only / order</code>；
-    规划器管道（Vercel AI Gateway）必须用 <code class="mono">providerOptions.gateway.only / order</code>——
-    Cline 会丢弃顶层 <code class="mono">provider</code> 简写里的 <code class="mono">only/order</code>，但会透传 <code class="mono">providerOptions.gateway</code>。
-    两类管道还都支持 <code class="mono">sort</code>（最低成本 / 最快首字 / 最高吞吐）。<br>
-    ③ <b>目录模型 :free 变体</b>：属于直连管道，可精确钉住。<br>
-    ④ <b>多上游优先级 + 故障转移</b>：勾选多个上游即按勾选顺序逐个尝试——第一个异常（报错/网络失败/超时）自动顺切下一个，全部失败才把错误透传给客户端；「排除」的上游永不被使用（自动模式下会向网关注入排除偏好）。流式请求在首包（SSE 开始）前同样可切换，SSE 开始后透传不可重试。
+    <b>这个工具是干什么的？</b>你订阅了 Cline Pass 之后，同一个模型背后其实有好几家公司在提供算力（这些话里叫「上游」）。
+    Cline 默认自己分配，你既不知道这次是谁在服务，也没法指定。这个工具就是让你能<b>看见</b>、并且<b>指定</b>。
+    <details style="margin-top:8px">
+      <summary style="cursor:pointer; color:var(--accent)">展开看更多说明</summary>
+      <div style="margin-top:8px; line-height:1.9;">
+        ① <b>能看见</b>：每条请求都会记录本次到底是哪家上游在服务你，在「请求历史」里能看到。<br>
+        ② <b>能指定</b>：点「优先」把想要的上游加进候选名单，再选「严格钉住」就能锁定，详见下方「订阅模型」区的说明。<br>
+        ③ <b>探测</b>：「探测」按钮会问 Cline「这个模型有哪些上游可用」，不需要你真的花钱跑一次完整对话。<br>
+        ④ <b>自动换人</b>：如果第一个上游报错、超时或网络不通，会自动换下一个重试；全部失败才会把错误返回给你。
+        流式输出在还没有吐出任何内容之前也能换人，一旦开始输出就没法再换。
+      </div>
+    </details>
   </div>
 
   <div class="toolbar">
-    <span class="chip" id="proxyBase" title="点击复制：把任意 OpenAI 兼容客户端的 Base URL 指向这里"></span>
+    <span class="chip" id="proxyBase" title="点击复制。把你所用客户端的 Base URL 改成这个地址，请求就会经过本工具"></span>
     <button class="ghost" onclick="loadAll()">↻ 刷新</button>
-    <button class="ghost" onclick="probeAll()" id="probeAllBtn">批量探测订阅模型</button>
+    <button class="ghost" onclick="probeAll()" id="probeAllBtn" title="逐个询问 Cline 每个模型有哪些上游可用（结果缓存在本地）">批量探测订阅模型</button>
     <span class="dim" style="font-size:12px" id="status"></span>
   </div>
 
@@ -168,12 +200,47 @@
         <button class="ghost" onclick="fetchOfficial(this)" title="从 Cline 官方推荐模型接口、官方文档与社区注册表拉取最新订阅模型清单并合并（只增不删）">⬇ 拉取官方最新模型</button>
       </div>
     </div>
+    <div class="banner" style="margin:12px 0 0; border-left-color: var(--accent); font-size:12.5px; line-height:1.85;">
+      <b>这个表格在管什么？</b>同一个模型，Cline 背后其实有好几家服务商（叫「上游」）在提供。这里就是让你决定：这次请求尽量交给谁、哪些绝对不用。
+      <div style="margin-top:8px">
+        <b>① 先选上游（点「优先」）</b>：点一下某个上游的「优先」，它就加入候选名单，左边的圆圈数字就是尝试顺序；点「排除」的则永远不用。不点任何「优先」= 让 Cline 自己挑。
+      </div>
+      <div style="margin-top:6px">
+        <b>② 再选怎么用（右边的「严格钉住 / 优先+回退」）</b>：只有在你勾了 2 个以上「优先」时这个选项才真正起作用。
+      </div>
+      <details style="margin-top:8px">
+        <summary style="cursor:pointer; color:var(--accent)">这两种模式到底差在哪？（点开看）</summary>
+        <div style="margin-top:6px; padding-left:10px; border-left:2px solid var(--border);">
+          <div style="margin-bottom:6px">
+            <b>严格钉住</b> —— 「必须用它」。假设你勾了 A、B：先只许用 A，Cline 绝对不能偷偷换成别家；A 出问题（报错、超时）时，本工具再单独发一次「只许用 B」的请求。「钉死 DeepSeek」就该用这个。
+          </div>
+          <div>
+            <b>优先+回退</b> —— 「首选用它」。同样勾了 A、B：告诉 Cline「优先 A，不行就用 B」，剩下的交给 Cline 自己决定，所以可能少绕一圈、更不容易失败，但你没法保证最终是谁在服务。适合「能用就行，稳定第一」。
+          </div>
+          <div style="margin-top:6px; color:var(--dim)">
+            一句话：<b>严格</b>是「下命令」，<b>优先+回退</b>是「提建议」。想要确定的结果选严格，想要更高的成功率选优先+回退。
+          </div>
+        </div>
+      </details>
+      <div style="margin-top:8px">
+        <b>③ DeepSeek 用户请直接用默认值</b>：<code class="mono">deepseek-v4.1-flash-1017</code> 这个模型已经帮你配好了「严格钉住 DeepSeek + 两项能力要求」。
+        两项要一起生效才管用（只配其中一项，请求仍可能被送去别家），所以别单独删掉其中一个；想恢复就点该行的「应用 DeepSeek 预设」。
+      </div>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; margin:12px 0; flex-wrap:wrap;">
+      <label class="dim" style="font-size:13px">上游策略：</label>
+      <select id="providerPolicy" onchange="saveProviderPolicy(this.value)" title="决定听谁的：听本页设置，还是听你所用客户端的设置">
+        <option value="config">以本页设置为准（推荐）</option>
+        <option value="client">以客户端设置为准</option>
+      </select>
+      <span class="dim" style="font-size:12px">有些客户端会自己指定想用哪家上游。选「以本页设置为准」时，本页的配置说了算，客户端的要求会被忽略；选「以客户端设置为准」时，客户端的优先，它没提的部分才用本页配置补上。不确定就用推荐的第一个。</span>
+    </div>
     <div class="result" id="fetchResult" style="display:none; margin-bottom:12px;"></div>
     <table>
       <thead><tr>
-        <th>模型</th><th>背后模型</th><th>上游数</th><th>最近实际上游</th><th>上游优先级 / 排除（多选）</th><th>模式 / 排序</th><th>操作</th>
+        <th>模型</th><th>实际背后模型</th><th>上游数</th><th>最近谁在服务</th><th>选上游（点「优先」/「排除」）</th><th>能力要求 / 思考强度</th><th>怎么用</th><th>操作</th>
       </tr></thead>
-      <tbody id="subBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+      <tbody id="subBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
     </table>
   </div>
 
@@ -182,17 +249,28 @@
     <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
       <select id="testModel" style="min-width:240px"></select>
       <select id="testUpstream" style="min-width:200px"><option value="">自动（不指定上游）</option></select>
+      <input id="testHas" class="pin-input" style="width:240px" placeholder="能力要求（可选，留空沿用已保存的）" autocomplete="off" spellcheck="false">
       <button onclick="runTest()" id="testBtn">发送测试</button>
-      <span class="dim" style="font-size:12px">使用 max_tokens=256 的小请求，消耗极小</span>
+      <span class="dim" style="font-size:12px">发一条很短的请求，花费极小</span>
     </div>
+    <div class="dim" style="font-size:12px; margin-top:6px">「能力要求」留空 = 沿用这个模型已保存的设置；填了内容 = 只对这次测试生效，不会改动保存的配置。测试结果会显示在下方，并记录到请求历史里。</div>
     <div class="result" id="testResult"></div>
   </div>
 
   <div class="card">
-    <h2>请求历史（最近 100 条，经代理的请求自动记录）</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+      <h2 style="margin:0">请求历史（最近 100 条，经代理的请求自动记录）</h2>
+      <div style="display:flex; gap:10px; align-items:center;">
+        <span class="dim" style="font-size:12px" id="histUpdated"></span>
+        <label class="dim" style="font-size:12px; display:flex; align-items:center; gap:4px; cursor:pointer;" title="每 5 秒自动拉取一次，内容没变就不重建表格">
+          <input type="checkbox" id="histAuto" checked onchange="toggleHistAuto(this.checked)"> 自动刷新
+        </label>
+        <button class="ghost" onclick="refreshHistory(this)" title="立即重新拉取一次请求历史">↻ 刷新</button>
+      </div>
+    </div>
     <table>
       <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th>方式</th><th>尝试序列</th></tr></thead>
-      <tbody id="histBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
+      <tbody id="histBody"><tr><td colspan="8" class="empty">暂无记录</td></tr></tbody>
     </table>
   </div>
 
@@ -236,7 +314,7 @@ async function tryLogin() {
   }
 }
 
-const ST_TAG = { ok: '✔可用', limited: '⏳限流', bad: '✘不可钉', auth: '🔑key错' };
+const ST_TAG = { ok: '✔ 能用', limited: '⏳ 限流中', bad: '✘ 用不了', auth: '🔑 账号异常' };
 const ST_RANK = { ok: 0, limited: 1, unknown: 2, auth: 3, bad: 4 };
 const ST_CLS = { ok: 'ok', limited: 'limited', bad: 'bad', auth: 'auth' };
 
@@ -278,22 +356,22 @@ function upstreamPanel(id, meta, cfg) {
     const stTxt = st && ST_TAG[st] ? ST_TAG[st] : '';
     const stCls = ST_CLS[st] || 'unknown';
     return `<div class="uprow${isEx ? ' excluded' : ''}" data-m="${id}" data-u="${u}" data-stat="${stTxt}" data-statcls="${stCls}">
-      <span class="upno" title="优先级顺序（尝试顺序）">${no >= 0 ? no + 1 : ''}</span>
+      <span class="upno" title="尝试顺序：数字越小越先尝试">${no >= 0 ? no + 1 : ''}</span>
       <span class="upinfo"><span class="upslug mono">${u}</span><span class="upname" title="${d ? d.name : ''}">${d ? d.name : ''}${d && d.endpoints > 1 ? ' ×' + d.endpoints : ''}</span></span>
       <span class="upstat ${isEx ? 'excl' : stCls}">${isEx ? '🚫已排除' : stTxt}</span>
-      <button class="pill${isSel ? ' prio-on' : ''}" title="优先：加入尝试序列（异常自动顺切下一个）；再点一次取消" onclick="toggleUp('${id}','sel','${u}',${isSel ? 'false' : 'true'})">优先</button>
-      <button class="pill${isEx ? ' excl-on' : ''}" title="排除：该上游永不被使用；再点一次取消" onclick="toggleUp('${id}','excl','${u}',${isEx ? 'false' : 'true'})">排除</button>
-      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveUp('${id}','${u}')" title="上移提高优先级">↑</button>
-      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveDown('${id}','${u}')" title="下移降低优先级">↓</button>
+      <button class="pill${isSel ? ' prio-on' : ''}" title="加入候选名单。可以点多个，点亮的顺序就是尝试顺序；中途某个出问题会自动换下一个。再点一次取消。" onclick="toggleUp('${id}','sel','${u}',${isSel ? 'false' : 'true'})">优先</button>
+      <button class="pill${isEx ? ' excl-on' : ''}" title="永不用这家。优先级高于「优先」：即使它被点亮了也不会被使用。再点一次取消。" onclick="toggleUp('${id}','excl','${u}',${isEx ? 'false' : 'true'})">排除</button>
+      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveUp('${id}','${u}')" title="往前挪一位，更早被尝试">↑</button>
+      <button class="ghost mini arrow-btn" style="${isSel ? '' : 'display:none'}" onclick="moveDown('${id}','${u}')" title="往后挪一位，更晚被尝试">↓</button>
     </div>`;
   }).join('');
   return `<details class="ups-wrap">
     <summary><span class="ups-sum">${summaryChips(cfg)}</span></summary>
     <div class="ups-panel">${rows || '<div class="empty">尚未探测到上游，先点「探测」</div>'}
       <div class="ups-tools">
-        <button class="ghost mini" onclick="bulkUp('${id}','all')" title="全部按可用状态排序加入优先序列">全选优先</button>
-        <button class="ghost mini" onclick="bulkUp('${id}','clear')" title="清空优先与排除（回到自动）">清空</button>
-        <span class="dim" style="font-size:11px; align-self:center;">点「优先」按序尝试（异常自动顺切）；点「排除」永不使用</span>
+        <button class="ghost mini" onclick="bulkUp('${id}','all')" title="把所有检测到的可用上游都加入候选名单，按可用性排序">全选优先</button>
+        <button class="ghost mini" onclick="bulkUp('${id}','clear')" title="清空所有选择，让 Cline 自己挑上游">清空</button>
+        <span class="dim" style="font-size:11px; align-self:center;">点「优先」加入候选（按顺序尝试，出问题自动换下一个）；点「排除」永不使用</span>
       </div>
     </div>
   </details>`;
@@ -303,23 +381,91 @@ function upstreamPanel(id, meta, cfg) {
 function summaryChips(cfg) {
   const ups = cfg.upstreams || [];
   const exc = cfg.exclude || [];
-  if (!ups.length && !exc.length) return '<span class="sum-auto">自动 · 网关智能选择</span>';
+  const has = cfg.has || [];
   let html = '';
+  if (!ups.length && !exc.length) html += '<span class="sum-auto">自动 · 网关智能选择</span>';
   for (let i = 0; i < Math.min(ups.length, 4); i++) html += `<span class="sum-chip">${i + 1}&nbsp;${ups[i]}</span>`;
   if (ups.length > 4) html += `<span class="sum-chip sum-more">+${ups.length - 4}</span>`;
   if (exc.length) html += `<span class="sum-chip sum-ex">✕ ${exc.length}</span>`;
+  if (has.length) html += `<span class="sum-chip sum-has">能力 ${has.join('+')}</span>`;
   return html;
+}
+
+// 能力过滤面板：输入框 + 保存状态 + DeepSeek 组合预设。
+// 预设只按上游 ID 精确匹配显示，客户端别名不参与判断。
+const DEEPSEEK_1017 = 'cline-pass/deepseek-v4.1-flash-1017';
+
+function capabilityPanel(id, cfg) {
+  // hasRaw：'unset' 表示从未设置（采用模型默认值）；数组表示自定义或显式清空。
+  const raw = cfg.hasRaw;
+  const fromDefault = cfg.hasFromDefault === true;
+  const current = raw === 'unset' ? (cfg.has || []) : raw;
+  const value = (current || []).join(', ');
+  const fromDefaultState = raw === 'unset' || fromDefault;
+  let hint = '没设置能力要求。只有填了内容才会生效。';
+  let hintCls = 'dim';
+  if (raw === 'unset' && (cfg.has || []).length) {
+    hint = `正在使用系统预置要求：${cfg.has.join('、')}。清空即可关掉。`;
+    hintCls = 'good';
+  } else if (raw !== 'unset' && Array.isArray(raw) && raw.length === 0) {
+    hint = '已关闭：不会再提额外要求，也不会被自动加回来。';
+    hintCls = 'warn';
+  } else if ((current || []).length) {
+    hint = `正在要求上游满足：${current.join('、')}`;
+    hintCls = 'good';
+  }
+  const upstreamId = cfg.upstreamId || id;
+  const showPreset = upstreamId === DEEPSEEK_1017
+    ? `<button class="preset-btn" type="button" onclick="applyDeepseekPreset('${id}')" title="一键恢复官方推荐的 DeepSeek 配置：指定上游 deepseek，并要求两项能力，保存后立即生效">应用 DeepSeek 预设</button>`
+    : '';
+  return `<div class="pin-editor">
+    <div class="pin-row"><label for="pinHas-${id}">能力要求（可选，一般不用动）</label>${showPreset}</div>
+    <input class="pin-input" id="pinHas-${id}" data-model="${id}" value="${escapeHtml(value)}"
+      placeholder="留空 = 不限制" autocomplete="off" spellcheck="false"
+      onchange="saveHas('${id}', this)" onkeydown="if(event.key==='Enter')this.blur()">
+    <div class="pin-hint ${hintCls}">${escapeHtml(hint)}</div>
+    ${reasoningPanel(id, cfg)}
+  </div>`;
+}
+
+const REASONING_SOURCES = [
+  ['unset', '未设置'], ['none', 'none'], ['minimal', 'minimal'], ['low', 'low'],
+  ['medium', 'medium'], ['high', 'high'], ['xhigh', 'xhigh'], ['max', 'max'], ['ultra', 'ultra'],
+];
+const REASONING_TARGETS = ['unset', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+function reasoningPanel(id, cfg) {
+  const mapping = cfg.reasoningMapping || { enabled: false, rules: {} };
+  const rules = mapping.rules || {};
+  // 规则表为空时显示 DeepSeek 预填表作为占位，避免「全部未设置」的下拉框让人误以为功能坏了。
+  const table = Object.keys(rules).length ? rules : deepseekDefaultRules();
+  const rows = REASONING_SOURCES.map(([from, label]) => {
+    const options = REASONING_TARGETS.map((t) => `<option value="${t}" ${table[from] === t ? 'selected' : ''}>${t === 'unset' ? '未设置' : t}</option>`).join('');
+    return `<label>${label}<select data-reasoning-from="${from}" data-model="${id}" onchange="saveReasoning('${id}', this)">${options}</select></label>`;
+  }).join('');
+  return `<details class="ups-wrap reasoning-panel">
+    <summary><span class="ups-sum"><span class="sum-auto">思考强度映射${mapping.enabled ? ' · 已启用' : ' · 关闭'}</span></span></summary>
+    <div style="padding:6px 2px">
+      <label class="dim" style="font-size:12px; display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+        <input type="checkbox" data-model="${id}" ${mapping.enabled ? 'checked' : ''} onchange="toggleReasoning('${id}', this.checked)"> 启用映射（把客户端 reasoning_effort 转成上游接受的值）
+      </label>
+      <div class="reasoning-grid">${rows}</div>
+      <div class="pin-hint dim" style="margin-top:6px">「未设置 → X」可为未传强度的请求补值；目标「未设置」则移除顶层字段。请求已带 thinking / reasoning 嵌套配置时不补默认值。</div>
+    </div>
+  </details>`;
 }
 
 function render() {
   $('#proxyBase').textContent = '代理地址：' + DATA.proxyBase + '（点击复制）';
+  const policySel = $('#providerPolicy');
+  if (policySel) policySel.value = DATA.providerPolicy || 'config';
   const rows = DATA.subscription.map((s) => {
     const m = s.meta;
     const ups = (m?.upstreams?.length ?? null);
-    const last = m?.lastProvider ? `<span class="badge">${m.lastProvider}</span>` : '<span class="dim">未探测</span>';
+    const last = m?.lastProvider ? `<span class="badge">${m.lastProvider}</span>` : '<span class="dim">还没用过</span>';
     const canon = m?.canonicalSlug ? `<span class="mono dim">${m.canonicalSlug}</span>` : '<span class="dim">—</span>';
-    const tier0 = m?.tier0?.length ? `<div class="dim" style="font-size:11px">tier-0: ${m.tier0.join(', ')}</div>` : '';
-    const pipe = m?.pinnable ? `<span class="badge green">可精确钉住·${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>` : '<span class="badge orange">请先探测</span>';
+    const tier0 = m?.tier0?.length ? `<div class="dim" style="font-size:11px">优先渠道: ${m.tier0.join(', ')}</div>` : '';
+    const pipe = m?.pinnable ? `<span class="badge green" title="这个模型的上游可以精确指定">可指定上游</span>` : '<span class="badge orange" title="还没探测过，不知道有哪些上游可用，先点「探测」">点「探测」获取名单</span>';
     const mode = s.config.pinMode || 'strict';
     const sort = s.config.sort || '';
     return `<tr${LAST_ADDED.includes(s.id) ? ' class="row-new"' : ''} data-id="${s.id}">
@@ -331,21 +477,24 @@ function render() {
         ${upstreamPanel(s.id, m, s.config)}
       </td>
       <td>
-        <div><select onchange="saveCfg('${s.id}','pinMode',this.value)" title="严格：逐个只钉勾选的上游；优先：当前上游排 order 首位，其余勾选项作为网关侧回退">
+        ${capabilityPanel(s.id, s.config)}
+      </td>
+      <td>
+        <div><select data-field="pinMode" onchange="saveCfg('${s.id}','pinMode',this.value)" title="严格钉住：只用你勾选的上游，Cline 不能偷偷换别家；出问题时本工具再单独换下一个。优先+回退：告诉 Cline「优先用它」，允许它自己换成别的，成功率更高但结果不确定。勾了 2 个以上上游时这个选项才有意义。">
           <option value="strict" ${mode === 'strict' ? 'selected' : ''}>严格钉住</option>
           <option value="preferred" ${mode === 'preferred' ? 'selected' : ''}>优先+回退</option>
         </select></div>
-        <select onchange="saveCfg('${s.id}','sort',this.value)" style="margin-top:4px" title="按指标排序上游（不选上游时也可单独使用）">
-          <option value="" ${!sort ? 'selected' : ''}>网关智能选</option>
-          <option value="cost" ${sort === 'cost' ? 'selected' : ''}>最低成本</option>
-          <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>最快首字</option>
-          <option value="tps" ${sort === 'tps' ? 'selected' : ''}>最高吞吐</option>
+        <select data-field="sort" onchange="saveCfg('${s.id}','sort',this.value)" style="margin-top:4px" title="让 Cline 按指标挑选上游。注意：它只是在多个可用上游之间排个序，不会改变你勾选的候选范围。">
+          <option value="" ${!sort ? 'selected' : ''}>不限排序</option>
+          <option value="cost" ${sort === 'cost' ? 'selected' : ''}>挑最便宜的</option>
+          <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>挑响应最快的</option>
+          <option value="tps" ${sort === 'tps' ? 'selected' : ''}>挑输出最快的</option>
         </select>
       </td>
       <td><div class="row-actions">
-        <button class="ghost" onclick="probe('${s.id}', this)">探测</button>
-        <button class="ghost" onclick="test('${s.id}', this)">测试</button>
-        <button class="ghost" onclick="validate('${s.id}', this)" title="把每个上游渠道各钉一次最小请求，标出可用/限流/不可钉">校验</button>
+        <button class="ghost" onclick="probe('${s.id}', this)" title="问 Cline「这个模型有哪些上游可用」，刷新候选名单">探测</button>
+        <button class="ghost" onclick="test('${s.id}', this)" title="真的发一条很短的请求，看最终是哪家上游在服务（最可靠的验证方式）">测试</button>
+        <button class="ghost" onclick="validate('${s.id}', this)" title="把每个上游各试一次，标出哪些能用、哪些限流、哪些用不了。耗时约 1 分钟。">体检</button>
       </div></td>
     </tr>`;
   }).join('');
@@ -480,29 +629,39 @@ async function fetchOfficial(btn) {
 }
 
 async function validate(id, btn) {
-  btn.disabled = true; btn.textContent = '校验中…';
-  status(`正在校验 ${id} 的全部上游渠道（约需 1 分钟）…`);
+  btn.disabled = true; btn.textContent = '体检中…';
+  status(`正在逐个试 ${id} 的每家上游（约需 1 分钟，请稍候）…`);
   try {
     const r = await api('/api/validate-upstreams', { model: id });
-    status(`校验完成：✔可用 ${r.summary.ok} · ⏳限流 ${r.summary.limited} · ✘不可钉 ${r.summary.bad} · 🔑key错 ${r.summary.auth} · 未判定 ${r.summary.unknown}（下拉框已标注并排序）`);
+    status(`体检完成：能用 ${r.summary.ok} 家 · 暂时限流 ${r.summary.limited} 家 · 用不了 ${r.summary.bad} 家 · 账号异常 ${r.summary.auth} 家 · 未判定 ${r.summary.unknown} 家（名单已按可用性排序）`);
   } catch (e) {
-    status('校验失败');
+    status('体检失败，请稍后重试');
   }
-  btn.disabled = false; btn.textContent = '校验';
+  btn.disabled = false; btn.textContent = '体检';
   await loadAll();
 }
 
 async function runTest() {
   const btn = $('#testBtn'); btn.disabled = true; btn.textContent = '发送中…';
   const model = $('#testModel').value, up = $('#testUpstream').value || null;
-  const r = await api('/api/test', { model, upstreams: up ? [up] : [] });
+  const body = { model, upstreams: up ? [up] : [] };
+  // 留空表示沿用已保存配置；填写则本次临时覆盖，不落盘。
+  const hasText = ($('#testHas').value || '').trim();
+  if (hasText) body.has = parseHasInput(hasText);
+  const r = await api('/api/test', body);
   btn.disabled = false; btn.textContent = '发送测试';
   showTest(r, model, up ? [up] : []);
 }
 
 function onTestModelChange() {
-  const m = DATA.subscription.find((s) => s.id === $('#testModel').value);
-  $('#testUpstream').innerHTML = upstreamOptions(m?.meta, null);
+  const s = DATA.subscription.find((x) => x.id === $('#testModel').value);
+  $('#testUpstream').innerHTML = upstreamOptions(s?.meta, null);
+  const input = $('#testHas');
+  if (input) {
+    const cfg = s?.config || {};
+    input.placeholder = `能力要求（可选，留空沿用已保存的${(cfg.has || []).length ? '：' + cfg.has.join('、') : ''}）`;
+    input.value = '';
+  }
 }
 
 // 逐次尝试明细：fireworks(✗429 781ms) → sail-research(✔ 2458ms)
@@ -523,37 +682,120 @@ function showTest(r, model, target) {
   const hitExcluded = Array.isArray(r.exclude) && r.exclude.length && r.exclude.includes(r.actual);
   el.innerHTML = `<div class="kvs">
       <div>模型 <b class="mono">${model}</b></div>
-      <div>目标上游 <b>${targets.length ? targets.join(' → ') : '自动'}</b></div>
-      <div>实际上游 <b class="${hit && !hitExcluded ? 'match' : 'mismatch'}">${r.actual || '未知'}</b></div>
+      <div>你指定的上游 <b>${targets.length ? targets.join(' → ') : '不指定（交给 Cline）'}</b></div>
+      <div>实际服务方 <b class="${hit && !hitExcluded ? 'match' : 'mismatch'}">${r.actual || '未知'}</b></div>
       <div>耗时 <b>${r.ms} ms</b></div>
     </div>${traceHtml(r.trace)}
-    ${hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${r.actual}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
-    <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${r.canonicalSlug || '—'}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>`;
+    ${hitExcluded ? `<div class="mismatch">⚠ 被排除的上游居然生效了：${r.actual}。可能是本地名单过期（先点「探测」刷新一下），或 Cline 没遵守排除设置。</div>` : hit ? '✔ 成功，你选的上游确实生效了。' : (r.actual ? `这次是「${r.actual}」在服务，没走到你首选的那个。可能是它正在限流或者用不了——可点「体检」看看哪家能用，或者把「怎么用」改成「优先+回退」提高成功率。` : '这条响应没告诉我们最终是谁在服务，暂时无法确认。')}
+    <div class="dim" style="margin-top:6px">模型回复：${escapeHtml(r.content || '(空)')}　·　实际背后的模型：${r.canonicalSlug || '—'}</div>`;
 }
 
-// —— perModel 配置保存：POST 完整字段（upstreams + exclude 一起），UI 由调用方乐观更新 ——
+// —— perModel 配置保存：POST 完整字段（upstreams + exclude + has + 思考强度一起），UI 由调用方乐观更新 ——
 async function saveModelCfg(id, patch) {
   const s = DATA.subscription.find((x) => x.id === id);
-  if (!s) return;
+  if (!s) return false;
   const cfg = s.config;
+  // hasRaw 为 'unset' 时表示「从未设置」，传 undefined 让服务端沿用模型默认值；
+  // 数组（含空数组）则原样提交，空数组即「显式关闭」。
+  const has = patch.has !== undefined ? patch.has : (cfg.hasRaw === 'unset' ? undefined : cfg.hasRaw);
   const full = {
     upstreams: patch.upstreams !== undefined ? patch.upstreams : (cfg.upstreams || []),
     exclude: patch.exclude !== undefined ? patch.exclude : (cfg.exclude || []),
     pinMode: patch.pinMode !== undefined ? patch.pinMode : (cfg.pinMode || 'strict'),
     sort: patch.sort !== undefined ? patch.sort : (cfg.sort || null),
+    reasoningMapping: patch.reasoningMapping !== undefined ? patch.reasoningMapping : (cfg.reasoningMapping || { enabled: false, rules: {} }),
   };
+  if (has !== undefined) full.has = has;
   try {
     const r = await api('/api/config', { perModel: { [id]: full } });
     if (r.ok) {
       cfg.upstreams = full.upstreams; cfg.exclude = full.exclude; cfg.pinMode = full.pinMode; cfg.sort = full.sort;
+      if (has !== undefined) { cfg.hasRaw = has; }
+      if (full.reasoningMapping) cfg.reasoningMapping = full.reasoningMapping;
       status(`${id} 配置已保存`);
-    } else {
-      status(`${id} 保存失败：${r.error?.message || '未知错误'}`);
-      await loadAll();
+      return true;
     }
+    status(`${id} 保存失败：${r.error?.message || '未知错误'}`);
+    await loadAll();
+    return false;
   } catch {
     await loadAll();
+    return false;
   }
+}
+
+// 能力过滤保存：空输入 = 显式清空（has: []），有内容则解析成败 slug 列表。
+async function saveHas(id, input) {
+  const s = DATA.subscription.find((x) => x.id === id);
+  if (!s) return;
+  const tokens = parseHasInput(input.value);
+  input.classList.remove('invalid');
+  const duplicate = new Set(tokens).size !== tokens.length;
+  const invalid = tokens.some((t) => !/^[a-z0-9][a-z0-9._-]*$/.test(t));
+  if (duplicate || invalid) {
+    input.classList.add('invalid');
+    status('这些要求只能填英文小写单词（如 vision、implicit-caching），不能重复、不能有空格');
+    return;
+  }
+  const ok = await saveModelCfg(id, { has: tokens });
+  if (!ok) input.value = (s.config.hasRaw === 'unset' ? (s.config.has || []) : s.config.hasRaw || []).join(', ');
+  else { s.config.has = tokens; s.config.hasRaw = tokens; s.config.hasFromDefault = false; await loadAll(); }
+}
+
+// 解析输入框文本为 slug 列表（去空、转小写、保留顺序）
+function parseHasInput(text) {
+  return String(text ?? '').split(/[,\s]+/).filter(Boolean).map((t) => t.toLowerCase());
+}
+
+// DeepSeek 组合预设：同时写入上游 deepseek 与两项能力，随后自动保存。
+// 预设不修改模型 ID；实际是否命中 deepseek 仍以「测试」或请求历史的实际上游为准。
+async function applyDeepseekPreset(id) {
+  const s = DATA.subscription.find((x) => x.id === id);
+  if (!s) return;
+  const exclude = (s.config.exclude || []).filter((u) => u !== 'deepseek');
+  const ok = await saveModelCfg(id, { upstreams: ['deepseek'], exclude, has: ['vision', 'implicit-caching'] });
+  if (ok) status(`${id} 已应用 DeepSeek 预设：上游 deepseek + 能力 vision, implicit-caching`);
+  await loadAll();
+}
+
+// 思考强度映射保存（整表提交，未改动的规则保持原值）
+async function saveReasoning(id, select) {
+  const s = DATA.subscription.find((x) => x.id === id);
+  if (!s) return;
+  const rules = { ...((s.config.reasoningMapping || {}).rules || {}) };
+  rules[select.dataset.reasoningFrom] = select.value;
+  const mapping = { enabled: (s.config.reasoningMapping || {}).enabled === true, rules };
+  s.config.reasoningMapping = mapping;
+  await saveModelCfg(id, { reasoningMapping: mapping });
+}
+
+async function toggleReasoning(id, enabled) {
+  const s = DATA.subscription.find((x) => x.id === id);
+  if (!s) return;
+  const current = s.config.reasoningMapping || { enabled: false, rules: {} };
+  // 开启时若规则表为空，用 DeepSeek 预填表补齐 —— 否则「启用」实际什么都不做。
+  const needsSeed = enabled && Object.keys(current.rules || {}).length === 0;
+  const rules = needsSeed ? deepseekDefaultRules() : (current.rules || {});
+  const mapping = { enabled, rules };
+  s.config.reasoningMapping = mapping;
+  const ok = await saveModelCfg(id, { reasoningMapping: mapping });
+  if (ok && needsSeed) status(`${id} 已启用思考强度映射并预填默认规则表`);
+  await loadAll();
+}
+
+// 与服务端 defaultReasoningRules 保持一致的默认规则表
+function deepseekDefaultRules() {
+  return {
+    unset: 'unset', none: 'none', minimal: 'low', low: 'low',
+    medium: 'high', high: 'high', xhigh: 'high', max: 'max', ultra: 'max',
+  };
+}
+
+// 上游策略（全局）：config=配置优先 | client=客户端优先
+async function saveProviderPolicy(value) {
+  const r = await api('/api/config', { providerPolicy: value });
+  if (r.ok) { DATA.providerPolicy = r.providerPolicy; status(`上游策略已切换为${r.providerPolicy === 'config' ? '配置优先' : '客户端优先'}`); }
+  else { status('策略保存失败：' + (r.error?.message || '未知错误')); await loadAll(); }
 }
 
 // 下拉框保存入口（模式/排序）
@@ -561,6 +803,7 @@ async function saveCfg(id, field, value) {
   const patch = {};
   if (field === 'pinMode') patch.pinMode = value || 'strict';
   else if (field === 'sort') patch.sort = value || null;
+  else if (field === 'has') patch.has = parseHasInput(value);
   await saveModelCfg(id, patch);
 }
 
@@ -595,9 +838,11 @@ function updateRowUi(id) {
   });
   const sum = tr.querySelector('.ups-sum');
   if (sum) sum.innerHTML = summaryChips(cfg);
-  const selects = tr.cells[5].querySelectorAll('select');
-  if (selects[0]) selects[0].value = cfg.pinMode || 'strict';
-  if (selects[1]) selects[1].value = cfg.sort || '';
+  // 模式/排序列改为按字段定位，避免新增列后下标错位
+  const pinSel = tr.querySelector('select[data-field="pinMode"]');
+  const sortSel = tr.querySelector('select[data-field="sort"]');
+  if (pinSel) pinSel.value = cfg.pinMode || 'strict';
+  if (sortSel) sortSel.value = cfg.sort || '';
 }
 
 // 面板药丸切换：kind='sel' 优先 | 'excl' 排除（互斥）。乐观更新 + 保存（失败自动回滚）
@@ -651,17 +896,70 @@ function bulkUp(id, action) {
   }
 }
 
-async function loadHistory() {
-  const { history } = await api('/api/history');
-  $('#histBody').innerHTML = history.length ? history.map((h) => `<tr>
-      <td>${fmt(h.ts)}</td><td class="mono">${h.model}</td>
-      <td>${h.account ? '<span class="badge">' + h.account + '</span>' : '<span class="dim">—</span>'}</td>
-      <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
-      <td class="mono dim">${h.canonical || '—'}</td>
+// —— 请求历史：手动刷新 + 5 秒自动轮询 ——
+// 自动轮询只在内容指纹变化时才重建表格，避免每 5 秒闪一下、并保住 <details> 展开状态。
+let histFingerprint = '';
+let histTimer = null;
+let histLoading = false;
+
+function historyRows(history) {
+  return history.map((h) => `<tr>
+      <td>${fmt(h.ts)}</td><td class="mono">${escapeHtml(h.model || '')}</td>
+      <td>${h.account ? '<span class="badge">' + escapeHtml(h.account) + '</span>' : '<span class="dim">—</span>'}</td>
+      <td>${h.provider ? '<span class="badge">' + escapeHtml(h.provider) + '</span>' : '<span class="dim">—</span>'}</td>
+      <td class="mono dim">${escapeHtml(h.canonical || '—')}</td>
       <td>${h.ms ?? '—'} ms</td>
       <td>${h.stream ? '流式' : '非流式'}</td>
-      <td class="dim">${(h.trace || h.attempts || []).map((t) => typeof t === 'string' ? t : `${t.upstream || 'auto'}(${t.status === 200 ? '✔' : '✗'}${t.ms}ms)`).join(' → ') || '—'}</td>
-    </tr>`).join('') : '<tr><td colspan="8" class="empty">暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录</td></tr>';
+      <td class="dim">${(h.trace || h.attempts || []).map((t) => typeof t === 'string' ? escapeHtml(t) : `${escapeHtml(t.upstream || 'auto')}(${t.status === 200 ? '✔' : '✗'}${t.ms}ms)`).join(' → ') || '—'}</td>
+    </tr>`).join('');
+}
+
+async function loadHistory({ force = false } = {}) {
+  if (histLoading) return;
+  histLoading = true;
+  try {
+    const { history } = await api('/api/history');
+    const list = history || [];
+    // 指纹只取会影响渲染的字段，内容一致就跳过 DOM 重建。
+    const fingerprint = JSON.stringify(list.map((h) => [h.ts, h.model, h.provider, h.ms, h.error]));
+    if (force || fingerprint !== histFingerprint) {
+      histFingerprint = fingerprint;
+      $('#histBody').innerHTML = list.length
+        ? historyRows(list)
+        : '<tr><td colspan="8" class="empty">暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录</td></tr>';
+    }
+    const el = $('#histUpdated');
+    if (el) el.textContent = `已更新 ${new Date().toLocaleTimeString()}`;
+  } catch {
+    // 401 由 api() 统一弹登录框；其余错误静默，下一次轮询会重试。
+  } finally {
+    histLoading = false;
+  }
+}
+
+// 手动刷新：强制重建，并给按钮一个可见的反馈
+async function refreshHistory(btn) {
+  const label = btn?.textContent;
+  if (btn) { btn.disabled = true; btn.textContent = '刷新中…'; }
+  await loadHistory({ force: true });
+  if (btn) { btn.disabled = false; btn.textContent = label || '↻ 刷新'; }
+}
+
+function toggleHistAuto(on) {
+  localStorage.setItem('cps_hist_auto', on ? '1' : '0');
+  if (on) startHistPolling(); else stopHistPolling();
+}
+
+function startHistPolling() {
+  stopHistPolling();
+  histTimer = setInterval(() => {
+    // 页面不可见时跳过，避免后台标签页白跑请求。
+    if (!document.hidden) loadHistory();
+  }, 5000);
+}
+
+function stopHistPolling() {
+  if (histTimer) { clearInterval(histTimer); histTimer = null; }
 }
 
 let ACCS = null;
@@ -757,15 +1055,22 @@ $('#proxyBase').onclick = () => navigator.clipboard.writeText(DATA.proxyBase).th
 $('#testModel').addEventListener('change', onTestModelChange);
 $('#catFilter').addEventListener('input', renderCatalog);
 $('#loginKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryLogin(); });
+
+// 历史自动刷新偏好（默认开启）；切回前台时立即补一次，避免看到过期的列表。
+const histAuto = localStorage.getItem('cps_hist_auto') !== '0';
+$('#histAuto').checked = histAuto;
+document.addEventListener('visibilitychange', () => { if (!document.hidden) loadHistory(); });
+
 // 仅当服务端开启鉴权且本地没有已保存的密钥时才弹登录框
 (async () => {
   try {
     const meta = await (await fetch('/api/meta')).json();
-    if (meta.authRequired && !AUTH_KEY) showLogin();
-    else loadAll().catch(() => {});
-  } catch {
-    loadAll().catch(() => {});
-  }
+    if (meta.authRequired && !AUTH_KEY) { showLogin(); return; }
+  } catch { /* 元信息不可用也继续尝试加载 */ }
+  try {
+    await loadAll();
+    if (histAuto) startHistPolling();
+  } catch { /* 401 已由 api() 处理 */ }
 })();
 </script>
 </body>

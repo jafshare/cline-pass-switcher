@@ -10,6 +10,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import {
+  ConfigError,
+  PROVIDER_POLICY_CLIENT,
+  PROVIDER_POLICY_CONFIG,
+  applyReasoningMapping,
+  defaultHasFor,
+  defaultProvidersFor,
+  mergeProviderRouting,
+  normalizeHas,
+  normalizeProviders,
+  normalizeReasoningMapping,
+  parseSlugList,
+  resolveModelConfig,
+  routingCandidates,
+  unpinProbeBody,
+} from './lib/routing.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || __dirname;
@@ -23,11 +39,13 @@ const DEFAULT_CONFIG = {
   proxyKey: '',
   publicBaseUrl: '',
   exposeCatalog: false,    // true 时 /v1/models 合并完整目录模型（默认仅订阅模型）
+  providerPolicy: PROVIDER_POLICY_CONFIG, // config=配置优先（默认，丢弃客户端路由提示）| client=客户端逐字段优先
   upstreamBase: 'https://api.cline.bot/api/v1',
   accounts: [],            // { name, key, enabled } —— Cline Pass 账号池
   accountMode: 'single',   // single=手动指定 | roundrobin=轮询
   activeAccount: 0,        // single 模式下使用的账号下标
   knownModels: [
+    'cline-pass/deepseek-v4.1-flash-1017',
     'cline-pass/glm-5.3-flash',
     'cline-pass/kimi-k3',
     'cline-pass/deepseek-v4-flash',
@@ -45,10 +63,15 @@ const DEFAULT_CONFIG = {
     'cline-pass/qwen3.7-max',
   ],
   // modelId -> { upstreams: string[]（有序优先列表，空=自动）, exclude: string[]（排除列表，优先级高于勾选）,
-  //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null }
+  //              has: string[]|null（能力过滤，只写 providerOptions.gateway；null=未配置）,
+  //              pinMode: 'strict'|'preferred', sort: 'cost'|'ttft'|'tps'|null,
+  //              reasoningMapping: { enabled, rules } }
   // 请求按 upstreams 顺序逐个钉住尝试：第一个异常（非 200 / 网络失败 / 超时）自动顺切下一个，
   // 全部失败才把最后一个错误透传给客户端；exclude 中的上游永不被使用（自动模式下注入排除偏好）。
   // upstream 为旧版单上游兼容镜像（取列表第一个），maxRetries 已退役（旧值仅作回滚兼容保留在文件里）。
+  //
+  // DeepSeek 默认钉住（移植自 ClinePassBridge）：providers 判据是 id/upstream 含 deepseek，
+  // has 判据是上游 ID 精确等于 1017 模型。两者只在「从未设置」时补默认值，显式 [] 永久保持关闭。
   perModel: {},
 };
 
@@ -71,19 +94,55 @@ if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.
   saveConfig();
 }
 config.accountMode = config.accountMode === 'roundrobin' ? 'roundrobin' : 'single';
+config.providerPolicy = config.providerPolicy === PROVIDER_POLICY_CLIENT ? PROVIDER_POLICY_CLIENT : PROVIDER_POLICY_CONFIG;
 
-// perModel 配置升级：旧版单 upstream 迁移为有序多上游列表（upstream 保留为回滚兼容镜像）
+// perModel 配置升级：旧版单 upstream 迁移为有序多上游列表（upstream 保留为回滚兼容镜像）。
+// 能力过滤 has 走三态语义 —— 只有键不存在时才补默认值：显式 [] 表示操作者主动关闭，
+// null 表示采用模型默认值，两者都必须原样存活过迁移与重载，否则清空后会被悄悄回填。
 (function migratePerModel() {
   let dirty = false;
-  for (const c of Object.values(config.perModel || {})) {
-    if (!c || typeof c !== 'object') continue;
-    if (c.upstreams === undefined) { c.upstreams = c.upstream ? [c.upstream] : []; dirty = true; }
+  for (const [id, c] of Object.entries(config.perModel || {})) {
+    if (!c || typeof c !== 'object') { config.perModel[id] = {}; dirty = true; continue; }
+    // 旧版单 upstream 迁移为列表镜像。注意不要给「本来没有 upstreams」的条目补 []：
+    // 缺键表示从未设置（采用模型默认值），显式 [] 才表示操作者清空，两者语义不同。
+    if (c.upstreams === undefined && c.upstream) { c.upstreams = [c.upstream]; dirty = true; }
+    if (c.upstreams !== undefined && !Array.isArray(c.upstreams)) { c.upstreams = []; dirty = true; }
     if (c.exclude === undefined) { c.exclude = []; dirty = true; }
-    if (!Array.isArray(c.upstreams)) { c.upstreams = []; dirty = true; }
     if (!Array.isArray(c.exclude)) { c.exclude = []; dirty = true; }
+    // has：缺失/null → 按精确上游 ID 补默认；[] 与自定义值一律保持原样。
+    if (c.has === undefined || c.has === null) {
+      const seeded = defaultHasFor(id);
+      if (seeded) { c.has = seeded; dirty = true; }
+      else if (c.has === null) { delete c.has; dirty = true; }
+    }
+    if (c.reasoningMapping === undefined) {
+      c.reasoningMapping = { enabled: false, rules: {} };
+      dirty = true;
+    }
   }
   if (dirty) saveConfig();
 })();
+
+// 模型解析后的有效配置：把持久化的稀疏配置展开成「默认值 + 覆盖」。
+// 每次请求都重新计算，避免把默认值写死进请求路径。
+// upstreams 的缺省与显式 [] 必须区分：缺省 = 采用 DeepSeek 默认钉住，[] = 操作者清空回自动路由。
+function modelRuntime(id) {
+  const raw = config.perModel[id] || {};
+  const seeded = raw.upstreams === undefined ? (defaultProvidersFor(id, id) || []) : null;
+  const upstreams = seeded ?? (raw.upstreams || []);
+  const resolved = resolveModelConfig(raw, { id, upstreamId: id });
+  return {
+    raw,
+    upstreams: upstreams.filter((u) => typeof u === 'string' && u),
+    exclude: (raw.exclude || []).filter((u) => typeof u === 'string' && u),
+    has: resolved.has,
+    pinMode: raw.pinMode === 'preferred' ? 'preferred' : 'strict',
+    sort: ['cost', 'ttft', 'tps'].includes(raw.sort) ? raw.sort : null,
+    reasoningMapping: raw.reasoningMapping || null,
+    upstream: upstreams[0] || null,
+    providersFromDefault: seeded !== null,
+  };
+}
 
 // 环境变量覆盖（便于 Docker 部署）。注意：此后若通过控制台保存设置，当前生效值会写回 config.json
 if (process.env.CLINE_PASS_KEY) {
@@ -192,6 +251,25 @@ async function orEndpoints(slug) {
   return { slug: real, endpoints: Object.values(detail) };
 }
 
+// 探测专用：保留原始响应文本（路由块可能出现在 SSE 帧或错误消息里，只解析 JSON 会丢掉它）。
+async function fetchUpstreamRaw(body, key, timeoutMs = 180000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${config.upstreamBase}/chat/completions`, {
+      method: 'POST', headers: chatHeaders(key), body: JSON.stringify(body), signal: ctrl.signal,
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* SSE 或非 JSON 都是正常情形，原文本照样能读路由块 */ }
+    return { status: res.status, text, json };
+  } catch (e) {
+    return { status: 0, text: '', json: null, netError: e.message };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // ---------- 探测单个模型 ----------
 // 两条管道（实测）：
 // - planner：响应带 provider_metadata.gateway.routing（canonicalSlug/finalProvider/fallbacksAvailable），
@@ -250,20 +328,29 @@ function parseTier0(plan) {
 
 async function probeModel(modelId) {
   const acc = pickAccount();
+  const cfg = modelRuntime(modelId);
   const t0 = Date.now();
-  const body = { model: modelId, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
-  const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
-    method: 'POST',
-    headers: chatHeaders(acc.key),
-    body: JSON.stringify(body),
-  }, 180000);
+  // 主路径（移植自 ClinePassBridge）：保留有效 has 能力条件，剥离 only/order 等提供方提示，
+  // 发一个很小的真实请求，然后从原始响应帧里读候选与本次实际提供方。
+  // 这样「按已保存的能力条件探测候选」才成立 —— 发假上游骗错误文本的做法拿不到这个语义。
+  const base = { model: modelId, messages: [{ role: 'user', content: 'ok' }], max_tokens: 64 };
+  const probeBody = unpinProbeBody({ ...base, providerOptions: cfg.has?.length ? { gateway: { has: cfg.has } } : undefined }).body;
+  const probe = await fetchUpstreamRaw(probeBody, acc.key, 180000);
   const ms = Date.now() - t0;
-  if (json?.error && !json?.data) {
-    return { ok: false, error: typeof json.error === 'string' ? json.error : JSON.stringify(json.error) };
-  }
-  const r = parseRouting(json);
+  const routingRead = routingCandidates(probe.text);
+  const r = parseRouting(probe.json);
+
+  // 兜底：上游既没回报候选也没回报提供方时，才用「假上游报错误清单」的老办法。
   let harvest = null;
-  if (r.pipeline) harvest = await harvestAvailableProviders(modelId, r.pipeline);
+  const needFallback = routingRead.candidates.length === 0 && !routingRead.served && !r.finalProvider;
+  if (needFallback && r.pipeline) harvest = await harvestAvailableProviders(modelId, r.pipeline);
+
+  // 失败时也尽量保留可读信息：错误响应里同样可能带着路由块。
+  if (probe.json?.error && !probe.json?.data && !routingRead.served && routingRead.candidates.length === 0 && !harvest) {
+    const msg = typeof probe.json.error === 'string' ? probe.json.error : JSON.stringify(probe.json.error);
+    return { ok: false, error: msg, ms, has: cfg.has };
+  }
+
   let endpoints = [];
   let orSlug = null;
   if (r.pipeline !== 'planner' && r.canonicalSlug) {
@@ -277,27 +364,39 @@ async function probeModel(modelId) {
   const prev = META.models[modelId] || {};
   const detail = { ...prev.upstreamDetail };
   for (const e of endpoints) detail[e.slug] = e;
-  const upstreams = r.pipeline === 'planner'
-    ? [...new Set([...(harvest || []), ...r.fallbacks])]
-    : [...new Set([...r.fallbacks, ...(harvest || []), ...Object.keys(detail)])];
+  // 候选来源优先用路由帧读到的真实候选；__probe__ 兜底与 OpenRouter 明细只作补充。
+  const readCandidates = routingRead.candidates;
+  const upstreams = [...new Set([
+    ...readCandidates,
+    ...(harvest || []),
+    ...(readCandidates.length ? [] : r.fallbacks),
+    ...(r.pipeline === 'planner' ? [] : Object.keys(detail)),
+  ])];
   const tier0 = [...new Set([...(prev.tier0 || []), ...parseTier0(r.plan)])];
+  const served = routingRead.served || r.finalProvider || null;
   META.models[modelId] = {
     ...prev,
     ok: true,
     pipeline: r.pipeline,
     pinnable: !!r.pipeline,
-    availableProviders: harvest || prev.availableProviders || [],
+    availableProviders: readCandidates.length ? readCandidates : (harvest || prev.availableProviders || []),
     canonicalSlug: r.canonicalSlug,
     openrouterSlug: orSlug,
     upstreamDetail: detail,
     upstreams,
     tier0,
-    lastProvider: r.finalProvider || prev.lastProvider,
+    probedHas: cfg.has,
+    probeNote: readCandidates.length
+      ? '上游回报的候选托管方'
+      : served
+        ? '上游仅回报本次实际提供方，未列出其他候选'
+        : '上游未回报提供方或候选，请查看测试结果',
+    lastProvider: served || prev.lastProvider,
     lastMs: ms,
     probedAt: Date.now(),
   };
   saveMeta();
-  return { ok: true, ms, ...META.models[modelId] };
+  return { ok: true, ms, has: cfg.has, ...META.models[modelId] };
 }
 
 // 上游渠道可用性分类：渠道被单独钉住时的真实状态
@@ -454,69 +553,61 @@ function unwrap(json) {
   return { status: 200, body: d, routing: r };
 }
 
-// 按管道注入上游偏好（实测结论）：
-// - 规划器管道（Vercel AI Gateway）：顶层 provider 简写里的 only/order 会被 Cline 吞掉，
-//   必须用 providerOptions.gateway.{only,order,sort}；流式同样生效。
-// - 直连管道（OpenRouter）：顶层 provider.{only,order,sort} 生效；providerOptions 被忽略。
-// - 管道未知时两种形式同时注入，各自取用、互不干扰。
+// 按管道注入上游偏好。移植后不再「二选一」：管道路径可能随时间或账号变化，
+// 判错就静默失效，因此 only/order 同时写入顶层 provider 与 providerOptions.gateway，
+// 两条路由路径各自取用自己认识的形式。has 只写 providerOptions.gateway。
+// - 规划器管道（Vercel AI Gateway）：读 providerOptions.gateway.{only,order,sort,has}
+// - 直连管道（OpenRouter）：读顶层 provider.{only,order,sort}
 const OR_SORT = { cost: 'price', ttft: 'latency', tps: 'throughput' };
 
 // upstream: 本次尝试钉住的上游（null=自动）；orderRest: preferred 模式下排在当前上游之后的回退序列；
 // excludeList: 排除列表。网关不支持 exclude/ignore 字段（实测被静默忽略），因此排除统一换算成 only 白名单：
 // 自动模式 only=已知上游-排除；preferred 钉住模式 order=[当前,...] 且 only=已知上游-排除（防止网关回退到被排除渠道）；
 // 严格钉住模式 only=[当前上游]，天然排除其他一切渠道。
-function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null }) {
-  const b = JSON.parse(JSON.stringify(body));
-  const exclude = (excludeList || []).filter((u) => u !== upstream);
+function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null, has = null }) {
   const meta = META.models[modelId] || {};
+  const exclude = (excludeList || []).filter((u) => u !== upstream);
   const known = meta.upstreams || [];
   const allowList = exclude.length ? known.filter((u) => !exclude.includes(u)) : null;
-  if (!upstream && !sort && !(allowList && allowList.length)) return b;
-  const pipeline = meta.pipeline || null;
-  const useVercel = pipeline === 'planner' || pipeline === null;
-  const useOpenRouter = pipeline === 'direct' || pipeline === null;
-  if (useVercel) {
-    const gw = {};
-    if (upstream) {
-      if (strict) gw.only = [upstream];
-      else {
-        gw.order = [upstream, ...orderRest];
-        if (allowList && allowList.length) gw.only = allowList;
-      }
-    } else if (allowList && allowList.length) {
-      gw.only = allowList;
+
+  // 组装配置侧决策；未定义的字段不写入，交给 mergeProviderRouting 的「缺失才补」规则。
+  const decision = {};
+  if (upstream) {
+    if (strict) {
+      // 严格钉住：只允许这一个上游。order 仍写成同一项 —— 参考实现把 only/order
+      // 一起下发，缺一个会让只读 order 的路由路径退回自动选择。
+      decision.only = [upstream];
+      decision.order = [upstream];
+    } else {
+      decision.order = [upstream, ...orderRest];
+      if (allowList && allowList.length) decision.only = allowList;
     }
-    if (sort) gw.sort = sort;
-    b.providerOptions = { ...(b.providerOptions || {}), gateway: { ...(b.providerOptions?.gateway || {}), ...gw } };
+  } else if (allowList && allowList.length) {
+    decision.only = allowList;
   }
-  if (useOpenRouter) {
-    const p = { ...(b.provider || {}) };
-    if (upstream) {
-      if (strict) p.only = [upstream];
-      else {
-        p.order = [upstream, ...orderRest];
-        if (allowList && allowList.length) p.only = allowList;
-      }
-    } else if (allowList && allowList.length) {
-      p.only = allowList;
-    }
-    if (sort) p.sort = OR_SORT[sort] || sort;
-    b.provider = p;
+  if (Array.isArray(has) && has.length) decision.has = has;
+  if (sort) {
+    decision.gatewaySort = sort;
+    decision.providerSort = OR_SORT[sort] || sort;
   }
-  return b;
+
+  return mergeProviderRouting(body, decision, { policy: config.providerPolicy });
 }
 
-// 由 perModel 配置展开出故障转移候选序列：[{ upstream, orderRest, excludeList, strict, sort }, ...]
+// 由 perModel 配置展开出故障转移候选序列：[{ upstream, orderRest, excludeList, strict, sort, has }, ...]
 // - 勾选了上游（排除后非空）：逐个尝试，排除的永不在候选中
 // - 未勾选：单候选自动模式，排除换算成 only 白名单注入（见 injectPrefs）
+// has 与上游选择正交：无论钉不钉上游、走哪条管道，能力过滤都随每次尝试一起下发。
 function buildAttempts(modelId, cfg) {
-  const listed = (cfg?.upstreams || []).filter((u) => typeof u === 'string' && u);
-  const exclude = (cfg?.exclude || []).filter((u) => typeof u === 'string' && u);
+  const rt = cfg && cfg.upstreams !== undefined ? cfg : modelRuntime(modelId);
+  const listed = rt.upstreams || [];
+  const exclude = rt.exclude || [];
   const excl = new Set(exclude);
   const wanted = listed.filter((u) => !excl.has(u));
-  const strict = (cfg?.pinMode || 'strict') === 'strict';
-  const sort = cfg?.sort || null;
-  const base = { strict, sort, excludeList: exclude };
+  const strict = rt.pinMode !== 'preferred';
+  const sort = rt.sort || null;
+  const has = Array.isArray(rt.has) && rt.has.length ? rt.has : null;
+  const base = { strict, sort, excludeList: exclude, has };
   if (wanted.length) {
     // preferred 模式：当前上游排在 order 首位，其余勾选项作为网关侧回退序列；排除列表随行（限制网关回退范围）
     return wanted.map((u, i) => ({ ...base, upstream: u, orderRest: strict ? [] : wanted.filter((_, j) => j !== i) }));
@@ -548,9 +639,14 @@ async function attemptOnce(modelId, body, attempt, signal) {
 // 顺序故障转移：依次执行候选，非 200 / 网络失败 / 超时即切换下一个；全部失败返回最后一次结果。
 // 流式：首包前（网关以 JSON 而非 SSE 应答错误）仍可切换；SSE 一旦开始即透传，无法重试。
 // 每次尝试有独立的超时中止（attemptTimeoutMs）；客户端断开会中止当前尝试。
-// 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
+// 返回 { status, out, routing, acc, trace, streamUp?, reasoning? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
 async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
-  const attempts = buildAttempts(modelId, cfg);
+  const rt = cfg && cfg.upstreams !== undefined ? cfg : modelRuntime(modelId);
+  const attempts = buildAttempts(modelId, rt);
+  // 思考强度映射在任何尝试（含本地退避）之前只应用一次，
+  // 保证实际外发的 reasoning_effort 与落库的日志元数据来自同一份快照。
+  const mapped = applyReasoningMapping(body, rt.reasoningMapping);
+  const payload = mapped.body;
   const trace = [];
   const t0 = Date.now();
   let last = null;
@@ -566,7 +662,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
       const timer = setTimeout(() => ctrl.abort(), attemptTimeoutMs);
       try {
         if (stream) {
-          const send = injectPrefs(body, modelId, attempt);
+          const send = injectPrefs(payload, modelId, attempt);
           const acc = pickAccount();
           let up = null;
           let netError = null;
@@ -631,10 +727,10 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
           keepCloseHook = true;
           trace.push({ upstream: attempt.upstream, status: 200, ms, note: 'stream' });
-          return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
+          return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0, reasoning: mapped.applied };
         }
         // 非流式
-        const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
+        const r = await attemptOnce(modelId, payload, attempt, ctrl.signal);
         const ms = Date.now() - t1;
         const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
         trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
@@ -649,7 +745,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
   } finally {
     if (!keepCloseHook) req.off('close', onClientClose);
   }
-  return { ...last, status: last?.status ?? 502, trace, t0, netError: last?.netError || null };
+  return { ...last, status: last?.status ?? 502, trace, t0, netError: last?.netError || null, reasoning: mapped.applied };
 }
 
 async function handleChat(req, res) {
@@ -659,7 +755,7 @@ async function handleChat(req, res) {
   const modelId = body.model;
   if (!modelId) return sendJSON(res, 400, { error: { message: 'model is required' } });
 
-  const cfg = config.perModel[modelId] || {};
+  const cfg = modelRuntime(modelId);
   const targets = buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean);
   const isStream = !!body.stream;
 
@@ -704,7 +800,7 @@ async function handleChat(req, res) {
           provider = fp ? fp[1] : null;
           canonical = cs ? cs[1] : null;
         }
-        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto') });
+        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto'), has: cfg.has, reasoning: chain.reasoning });
         cb();
       },
     });
@@ -728,6 +824,8 @@ async function handleChat(req, res) {
     trace: chain.trace,
     error: status !== 200 ? out?.error?.message || null : null,
     account: acc ? acc.name : null,
+    has: cfg.has,
+    reasoning: chain.reasoning,
   });
   res.writeHead(status, {
     'Content-Type': 'application/json',
@@ -749,9 +847,12 @@ function sendJSON(res, status, obj) {
 
 async function catalog() {
   if (META.catalog && Date.now() - (META.catalogFetchedAt || 0) < 3600e3) return META.catalog;
-  const { json } = await fetchJSON(`${config.upstreamBase}/models`, { headers: chatHeaders(pickAccount().key) });
-  const ids = (json?.data || []).map((m) => m.id);
-  if (ids.length) { META.catalog = ids; META.catalogFetchedAt = Date.now(); saveMeta(); }
+  // 目录只是辅助信息：上游不可达时退回上次缓存，绝不让整个 /api/models 失败。
+  try {
+    const { json } = await fetchJSON(`${config.upstreamBase}/models`, { headers: chatHeaders(pickAccount().key) }, 15000);
+    const ids = (json?.data || []).map((m) => m.id);
+    if (ids.length) { META.catalog = ids; META.catalogFetchedAt = Date.now(); saveMeta(); }
+  } catch { /* 目录获取失败不影响订阅模型与钉住配置的展示 */ }
   return META.catalog || [];
 }
 
@@ -779,8 +880,37 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && p === '/api/models') {
       const cat = await catalog();
-      const sub = config.knownModels.map((id) => ({ id, config: config.perModel[id] || {}, meta: META.models[id] || null }));
-      return sendJSON(res, 200, { subscription: sub, catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(), officialFetch: META.officialModelsFetch || null });
+      const sub = config.knownModels.map((id) => {
+        const rt = modelRuntime(id);
+        const resolved = resolveModelConfig(rt.raw, { id, upstreamId: id });
+        return {
+          id,
+          // config 是持久化的稀疏配置（含 has 三态原值），effective 是叠加默认值后的实际下发形态。
+          config: {
+            upstreamId: id, // 本项目中客户端模型名即上游 ID（无重命名映射）
+            upstream: rt.upstream,
+            upstreams: rt.upstreams,
+            exclude: rt.exclude,
+            has: rt.has,
+            hasRaw: rt.raw.has === undefined ? 'unset' : rt.raw.has,
+            hasFromDefault: resolved.hasFromDefault,
+            providersFromDefault: resolved.providersFromDefault,
+            pinMode: rt.pinMode,
+            sort: rt.sort,
+            reasoningMapping: rt.reasoningMapping,
+          },
+          effective: { providers: resolved.providers, has: resolved.has },
+          meta: META.models[id] || null,
+        };
+      });
+      return sendJSON(res, 200, {
+        subscription: sub,
+        providerPolicy: config.providerPolicy,
+        catalogCount: cat.length,
+        catalog: cat,
+        proxyBase: publicProxyBase(),
+        officialFetch: META.officialModelsFetch || null,
+      });
     }
     if (req.method === 'POST' && p === '/api/probe') {
       const { model } = await JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -789,31 +919,39 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, r.ok ? 200 : 502, r);
     }
     if (req.method === 'POST' && p === '/api/test') {
-      // 临时配置可带 upstreams/exclude（数组）或旧版 upstream（单值），完整走故障转移链路
-      const { model, upstream, upstreams, exclude } = await JSON.parse(await readBody(req).then((b) => b.toString()));
+      // 临时配置可带 upstreams/exclude（数组）或旧版 upstream（单值），完整走故障转移链路。
+      // has 用于在不落盘的前提下验证某组能力条件，避免「先保存再试错」污染线上配置。
+      const { model, upstream, upstreams, exclude, has } = await JSON.parse(await readBody(req).then((b) => b.toString()));
       if (!model) return sendJSON(res, 400, { error: 'model required' });
       const t0 = Date.now();
-      const cfg = { ...(config.perModel[model] || {}) };
+      const cfg = { ...modelRuntime(model) };
       if (upstreams !== undefined) cfg.upstreams = upstreams;
       else if (upstream !== undefined) cfg.upstreams = upstream ? [upstream] : [];
       if (exclude !== undefined) cfg.exclude = exclude;
+      if (has !== undefined) {
+        try { cfg.has = has === null ? null : normalizeHas(has); }
+        catch (e) {
+          if (e instanceof ConfigError) return sendJSON(res, 400, { error: { message: e.message, type: 'config_error' } });
+          throw e;
+        }
+      }
       const body = { model, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
       const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000 });
       const trace = chain.trace || [];
       if (chain.status !== 200) {
         return sendJSON(res, 200, {
           ok: false, error: (chain.out?.error?.message || 'upstream error').slice?.(0, 400) || 'upstream error',
-          targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [], trace,
+          targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [], has: cfg.has, trace,
         });
       }
       const r = parseRouting(chain.out);
-      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null });
+      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null, has: cfg.has, reasoning: chain.reasoning });
       return sendJSON(res, 200, {
         ok: true, ms: Date.now() - t0,
-        targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
+        targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [], has: cfg.has,
         actual: r.finalProvider, actualName: r.finalProviderName, pipeline: r.pipeline, pinnable: r.pipeline !== null,
         canonicalSlug: r.canonicalSlug, fallbacks: r.fallbacks, content: (r.content || '').slice(0, 120),
-        account: chain.acc?.name || null, trace,
+        account: chain.acc?.name || null, trace, reasoning: chain.reasoning,
       });
     }
     if (req.method === 'GET' && p === '/api/accounts') {
@@ -888,28 +1026,61 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: true, ...r });
     }
     if (req.method === 'GET' && p === '/api/history') return sendJSON(res, 200, { history: META.history });
-    if (req.method === 'GET' && p === '/api/config') return sendJSON(res, 200, { port: config.port, perModel: config.perModel, knownModels: config.knownModels });
+    if (req.method === 'GET' && p === '/api/config') {
+      return sendJSON(res, 200, {
+        port: config.port,
+        providerPolicy: config.providerPolicy,
+        perModel: config.perModel,
+        knownModels: config.knownModels,
+      });
+    }
     if (req.method === 'POST' && p === '/api/config') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
-      if (body.perModel) {
-        for (const [m, c] of Object.entries(body.perModel)) {
-          const normalize = (v) => [...new Set((Array.isArray(v) ? v : []).map((s) => String(s).trim()).filter(Boolean))].slice(0, 10);
-          let upstreams = normalize(c.upstreams);
-          const exclude = normalize(c.exclude);
+      // 先在副本上完成全部校验，任何一项不合法就整体拒绝：
+      // 半写入会让「已保存」的提示与磁盘上的实际配置不一致。
+      const next = { ...config.perModel };
+      try {
+        if (body.providerPolicy !== undefined) {
+          const policy = String(body.providerPolicy);
+          if (policy !== PROVIDER_POLICY_CONFIG && policy !== PROVIDER_POLICY_CLIENT) {
+            throw new ConfigError('providerPolicy 必须是 config 或 client');
+          }
+        }
+        for (const [m, c] of Object.entries(body.perModel || {})) {
+          if (!c || typeof c !== 'object') throw new ConfigError(`${m} 的配置必须是对象`);
+          const clean = (v) => [...new Set((Array.isArray(v) ? v : []).map((s) => String(s).trim()).filter(Boolean))].slice(0, 10);
+          let upstreams = clean(c.upstreams);
+          const exclude = clean(c.exclude);
           const excl = new Set(exclude);
           upstreams = upstreams.filter((u) => !excl.has(u)); // 同时出现以 exclude 为准
-          const upstream = upstreams[0] || null; // 旧字段兼容镜像
-          config.perModel[m] = {
-            upstream,
+          const entry = {
+            upstream: upstreams[0] || null, // 旧字段兼容镜像
             upstreams,
             exclude,
             pinMode: c.pinMode === 'preferred' ? 'preferred' : 'strict',
             sort: ['cost', 'ttft', 'tps'].includes(c.sort) ? c.sort : null,
           };
+          // has 三态：null/缺失 表示采用模型默认值，[] 表示显式关闭，数组表示自定义。
+          // 非法输入（含空白、重复、超量）直接 400，不静默去重 —— 网关按精确 slug 匹配，写错就没有候选。
+          if (c.has === null) entry.has = null;
+          else if (c.has !== undefined) entry.has = normalizeHas(c.has);
+          // reasoningMapping 未提供时保留已有值，避免 UI 局部保存把它抹掉。
+          if (c.reasoningMapping !== undefined) {
+            entry.reasoningMapping = normalizeReasoningMapping(c.reasoningMapping) ?? { enabled: false, rules: {} };
+          } else if (next[m]?.reasoningMapping) {
+            entry.reasoningMapping = next[m].reasoningMapping;
+          }
+          if (next[m]?.upstreamStatus) entry.upstreamStatus = next[m].upstreamStatus;
+          next[m] = entry;
         }
-        saveConfig();
+      } catch (e) {
+        if (e instanceof ConfigError) return sendJSON(res, 400, { error: { message: e.message, type: 'config_error' } });
+        throw e;
       }
-      return sendJSON(res, 200, { ok: true });
+      config.perModel = next;
+      if (body.providerPolicy !== undefined) config.providerPolicy = body.providerPolicy;
+      saveConfig();
+      return sendJSON(res, 200, { ok: true, providerPolicy: config.providerPolicy });
     }
     if (req.method === 'GET' && (p === '/v1/models' || p === '/api/v1/models' || p === '/models')) {
       // 默认只暴露订阅模型，避免目录模型淹没客户端的模型选择器；exposeCatalog=true 时合并完整目录

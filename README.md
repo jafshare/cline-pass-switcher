@@ -10,6 +10,8 @@
 - 🎯 **精确钉住上游** —— 严格钉住 / 优先+回退两种模式，支持按最低成本、最快首字、最高吞吐排序
 - 🧬 **多上游优先级故障转移（2026-09-06 新增）** —— 勾选多个上游即按勾选顺序逐个尝试：第一个异常（报错 / 网络失败 / 超时）自动顺切下一个，全部失败才透传错误；每次尝试有独立 120s 超时与逐次尝试明细（请求头 X-Cline-Target-Upstream: a>b 与 X-Cline-Attempts，历史与测试台展示逐次尝试路径 upstream(502) 到 upstream(200)）
 - 🚫 **上游排除** —— 勾「排除」的渠道永不被使用：勾选模式下从候选中剔除；自动模式与优先+回退模式下把排除换算成 only 白名单（已知上游 - 排除项）注入，两类管道均实测生效；网关侧渠道清单更新导致白名单过期时，报错中附带的最新渠道清单会被自动学习合并
+- 🧠 **DeepSeek 组合钉住与能力过滤（2026-10-29 新增）** —— `only/order` 限制提供方，`has` 按能力标签过滤候选；`cline-pass/deepseek-v4.1-flash-1017` 默认同时下发两者，仅设任一都不够（见下节）
+- 🎚️ **思考强度映射** —— 按模型把客户端 `reasoning_effort` 转成上游接受的值，DeepSeek 预填规则表、默认关闭
 - 👥 **账号池** —— 多账号管理、手动切换、轮询均衡、逐账号连通性测试与用量统计
 - 📊 **观测** —— 每条请求自动记录实际命中的渠道、背后模型、耗时（含流式）
 - 🔑 **代理密钥** —— 给下游客户端发一把独立密钥，可随时在页面轮换
@@ -98,8 +100,9 @@ location / {
 | `proxyKey` | 下游代理密钥；空 = 不鉴权 |
 | `publicBaseUrl` | 公网代理地址（控制台展示用） |
 | `exposeCatalog` | `true` 时代理的 `/v1/models` 会合并 Cline 公开目录模型；默认 `false` 只返回订阅模型（避免客户端模型列表被淹没） |
+| `providerPolicy` | `config` 配置优先（默认）/ `client` 客户端优先，见上文「上游策略」 |
 | `knownModels` | 订阅模型清单（控制台主表） |
-| `perModel` | 每模型的钉住配置：`{ upstream, pinMode: strict|preferred, sort: cost|ttft|tps, maxRetries }` |
+| `perModel` | 每模型的钉住配置：`{ upstreams: string[], exclude: string[], has: string[]\|null, pinMode: strict\|preferred, sort: cost\|ttft\|tps, reasoningMapping: { enabled, rules } }` |
 | `apiKey` | 旧版单 key 字段，启动时自动迁移进 `accounts` |
 
 ---
@@ -130,8 +133,53 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 ### 上游枚举的三种手段
 
 1. **响应元数据回读**：规划器管道带 `canonicalSlug` / `fallbacksAvailable` / `finalProvider`；直连管道顶层 `provider` 即实际上游；
-2. **假上游探测**（零 token）：带不存在的 `only:["__probe__"]` 让网关在路由层报错并列出精确的可用渠道清单（两条管道的清单**不一致**，要分别取）；
-3. **OpenRouter 公开接口** `GET /api/v1/models/{slug}/endpoints`：补充上下文长度/在线率（对直连管道有直接参考意义）。
+2. **保留能力条件探测**（主路径）：按已保存的 `has` 发一个很小的真实请求，剥离 `only/order` 等提供方提示，从原始响应帧读候选 —— 这样「候选」才是符合当前能力条件的候选；
+3. **假上游探测**（兜底）：仅当上游既没回报候选也没回报提供方时，才带不存在的 `only:["__probe__"]` 让网关在路由层报错并列出精确的可用渠道清单（零 token，两条管道的清单不一致，要分别取）；
+4. **OpenRouter 公开接口** `GET /api/v1/models/{slug}/endpoints`：补充上下文长度/在线率（对直连管道有直接参考意义）。
+
+### DeepSeek 组合钉住与能力过滤（`has`）
+
+`only` 限制提供方，`has` 按能力标签过滤候选，两者作用不同。**实测（2026-10-23，单账号）：仅 `only=[deepseek]` 仍落 `openai-compatible-private` 私有通道，仅 `has=[vision,implicit-caching]` 会落 `fireworks`，两者组合才得到 `finalProvider=deepseek`。** 所以指定 DeepSeek 时必须一起设置。
+
+```json
+{
+  "model": "cline-pass/deepseek-v4.1-flash-1017",
+  "messages": [{ "role": "user", "content": "只回复 OK" }],
+  "providerOptions": {
+    "gateway": { "only": ["deepseek"], "has": ["vision", "implicit-caching"] }
+  }
+}
+```
+
+**默认值规则**（判据不同，不可混用）：
+
+| 配置 | 判据 | 默认值 |
+|---|---|---|
+| `providers` | `id` 或上游 ID 含 `deepseek`（包含匹配） | `["deepseek"]` |
+| `has` | 上游 ID **精确等于** `cline-pass/deepseek-v4.1-flash-1017` | `["vision", "implicit-caching"]` |
+
+因此无后缀的 `deepseek-v4.1-flash` 会默认钉 `deepseek`，但**不会**获得能力过滤 —— 实测该模型即使组合设置仍落私有通道。
+
+**三态语义**（这是最容易回归的地方）：
+
+| 配置中的 `has` | 含义 | 行为 |
+|---|---|---|
+| 键缺失 / `null` | 从未设置 | 采用模型默认值 |
+| `[]` | 操作者显式清空 | **永久关闭，不再回填** |
+| 非空数组 | 自定义 | 原样保留（转小写、去空白、拒重复） |
+
+升级时，已有 1017 映射若此前从未配置能力，会开始带上两项能力；已有提供方列表保持原值。想退出能力过滤，在界面清空输入框保存即可，重载后仍保持清空。
+
+**写入位置**：`only`/`order` 同时写入顶层 `provider` 与 `providerOptions.gateway`（两条路由路径各自取用自己认识的形式，不猜管道）；`has` **只**写入 `providerOptions.gateway`。
+
+**上游策略** `<code>providerPolicy</code>`：
+
+- `config`（默认）：忽略客户端传入的 `provider` / `providerOptions.gateway` 路由提示，由本页配置决定；
+- `client`：客户端传入的字段逐优先，缺失的字段由配置补齐；客户端显式发送 `has: []` 或 `has: null` 也原样保留。
+
+**判断是否命中**：看请求历史的「实际上游」列，对应 `routing.finalProvider`。仅看 `canonicalSlug` 中的模型名不够 —— `canonicalSlug` 已是 `deepseek/...` 时 `finalProvider` 仍可能是 `fireworks`。
+
+![能力过滤与思考强度](docs/screenshot-capability-filter.png)
 
 ### 实测记录（2026-09）
 
@@ -174,14 +222,38 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 **Q：限流的渠道还能用吗？**
 能。限流是共享池的临时状态，过段时间重新「校验」即可；或改用「优先+回退」模式，限流时自动跳到其他渠道。
 
-**Q：直接用官方 API 写 `provider.only` 为什么不生效？**
-对规划器管道（走 Vercel AI Gateway 的模型）会被 Cline 网关丢弃，请改用 `providerOptions.gateway`，见上文。
+**Q：只用官方 API 写 `provider.only` 为什么不生效？**
+对规划器管道（走 Vercel AI Gateway 的模型）会被 Cline 网关丢弃，请改用 `providerOptions.gateway`，见上文。本项目对 `only/order` 两种形式都写，所以不必判断模型走哪条管道。
+
+**Q：想钉 DeepSeek，为什么填了 `only=[deepseek]` 还是走私有通道？**
+因为公开候选路由还需要能力条件。加上 `has=[vision,implicit-caching]`（1017 模型默认已带，也可点「应用 DeepSeek 预设」恢复）。两者作用不同：`only` 限制提供方，`has` 过滤候选；实测仅 `only` 仍落 `openai-compatible-private`，仅 `has` 落 `fireworks`，组合才是 `deepseek`。
+
+**Q：清空了能力过滤，为什么又自己回来了？**
+不会。三态语义下「键缺失/null」才补默认值，界面清空存的是 `[]`（显式关闭），重载后保持清空。若用接口手写配置，请写 `"has": []`；删除该键等于「从未设置」，会被补默认值。
+
+**Q：无后缀的 `deepseek-v4.1-flash` 配了组合还是私有通道？**
+实测该模型即使 `only + has` 组合也仍落私有通道，只有 `-1017` 变体命中 `deepseek`。这是上游路由行为，不是配置错误。
 
 **Q：两条管道的渠道清单为什么不一样？**
 钉住发生在不同后端（OpenRouter vs Vercel AI Gateway），各自支持的渠道池不同，要以对应清单为准。
 
 **Q：订阅额度怎么计？**
 经代理的请求与直连官方 API 计费一致；「探测/测试/校验」会产生极小额的真实请求（每次约 0.0002 美元级）。
+
+---
+
+## 开发与测试
+
+```bash
+node server.js        # 启动
+npm test              # 运行测试（Node ≥ 18 自带 test runner，零依赖）
+```
+
+- `lib/routing.js` —— 纯函数：默认值判定、三态解析、slug 归一化、双写路由合并、探测候选解析、思考强度映射。无 IO，UI 与测试共用。
+- `test/routing.test.js` —— 语义单测（28 例）：三态存活、别名不串味、大小写归一、双写形态、策略合并表。
+- `test/capture.e2e.test.js` —— 端到端（9 例）：起 mock 上游捕获**真实外发请求体**，验证默认钉住、清空存活、策略行为与探测剥离。
+
+> 这批测试锁的是移植后最容易回归的地方：默认值判据、`[]` 与「缺失」的区分、以及 `only/order` 是否真的同时下发。
 
 ---
 
